@@ -24,6 +24,49 @@ from sparktts.models.audio_tokenizer import BiCodecTokenizer
 from sparktts.utils.token_parser import LEVELS_MAP, GENDER_MAP, TASK_TOKEN_MAP
 
 
+import threading
+import time
+from transformers.generation.streamers import BaseStreamer
+
+class GeneratedIDsStreamer(BaseStreamer):
+    """
+    自定义 streamer，用于流式提取生成的 token ids。
+    """
+    def __init__(self, tokenizer, skip_prompt=True, skip_special_tokens=True):
+        # 不传递额外参数给父类，仅调用默认初始化
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.skip_prompt = skip_prompt
+        self.skip_special_tokens = skip_special_tokens
+        self.generated_ids = []  # 存放增量生成的 token ids，每个元素通常是一批 token ids（tensor）
+        self.lock = threading.Lock()
+        self._finished = False
+
+    def put(self, output_ids):
+        # generate() 调用过程中，每次生成一批 token ids 时调用此方法
+        with self.lock:
+            self.generated_ids.append(output_ids)
+
+    def end(self):
+        # 标记生成结束
+        with self.lock:
+            self._finished = True
+
+    def __iter__(self):
+        while True:
+            with self.lock:
+                if self.generated_ids:
+                    # 复制当前缓冲区的内容，并清空缓冲区
+                    new_ids = self.generated_ids.copy()
+                    self.generated_ids.clear()
+                elif self._finished:
+                    break
+                else:
+                    new_ids = []
+            for ids in new_ids:
+                yield ids
+            time.sleep(0.1)
+
 class SparkTTS:
     """
     Spark-TTS for text-to-speech generation.
@@ -166,7 +209,7 @@ class SparkTTS:
         temperature: float = 0.8,
         top_k: float = 50,
         top_p: float = 0.95,
-    ) -> torch.Tensor:
+    ):
         """
         Performs inference to generate speech from text, incorporating prompt audio and/or text.
 
@@ -193,44 +236,55 @@ class SparkTTS:
             )
         model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
 
-        # Generate speech using the model
-        generated_ids = self.model.generate(
+
+        streamer = GeneratedIDsStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+        generate_kwargs = {
             **model_inputs,
-            max_new_tokens=3000,
-            do_sample=True,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-        )
+            "max_new_tokens": 3000,
+            "do_sample": True,
+            "top_k": top_k,
+            "top_p": top_p,
+            "temperature": temperature,
+            "streamer": streamer,
+        }
 
-        # Trim the output tokens to remove the input tokens
-        generated_ids = [
-            output_ids[len(input_ids) :]
-            for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
+        thread = threading.Thread(target=self.model.generate, kwargs=generate_kwargs)
+        thread.start()
 
-        # Decode the generated tokens into text
-        predicts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        for generated_ids in streamer:
 
-        # Extract semantic token IDs from the generated text
-        pred_semantic_ids = (
-            torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicts)])
-            .long()
-            .unsqueeze(0)
-        )
+            generated_ids = [generated_ids]
+            print(generated_ids)
 
-        if gender is not None:
-            global_token_ids = (
-                torch.tensor([int(token) for token in re.findall(r"bicodec_global_(\d+)", predicts)])
+            # Trim the output tokens to remove the input tokens
+            # generated_ids = [
+            #     output_ids[len(input_ids) :]
+            #     for input_ids, output_ids in zip(model_inputs.input_ids, new_ids)
+            # ]
+
+            # Decode the generated tokens into text
+            predicts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+            # Extract semantic token IDs from the generated text
+            pred_semantic_ids = (
+                torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicts)])
                 .long()
-                .unsqueeze(0)
                 .unsqueeze(0)
             )
 
-        # Convert semantic tokens back to waveform
-        wav = self.audio_tokenizer.detokenize(
-            global_token_ids.to(self.device).squeeze(0),
-            pred_semantic_ids.to(self.device),
-        )
+            if gender is not None:
+                global_token_ids = (
+                    torch.tensor([int(token) for token in re.findall(r"bicodec_global_(\d+)", predicts)])
+                    .long()
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
 
-        return wav
+            # Convert semantic tokens back to waveform
+            wav = self.audio_tokenizer.detokenize(
+                global_token_ids.to(self.device).squeeze(0),
+                pred_semantic_ids.to(self.device),
+            )
+
+            yield wav

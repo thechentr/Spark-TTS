@@ -59,7 +59,7 @@ def run_tts(
 
     # Perform inference and save the output audio
     with torch.no_grad():
-        wav = model.inference(
+        generater = model.inference(
             text,
             prompt_speech,
             prompt_text,
@@ -67,12 +67,9 @@ def run_tts(
             pitch,
             speed,
         )
-
-        sf.write(save_path, wav, samplerate=16000)
-
-    logging.info(f"Audio saved at: {save_path}")
-
-    return save_path
+        for chunk_wav in generater:
+            print(type(chunk_wav))
+            yield (16000, chunk_wav)
 
 
 def build_ui(model_dir, device=0):
@@ -91,13 +88,14 @@ def build_ui(model_dir, device=0):
         prompt_speech = prompt_wav_upload if prompt_wav_upload else prompt_wav_record
         prompt_text_clean = None if len(prompt_text) < 2 else prompt_text
 
-        audio_output_path = run_tts(
+        gennerater =  run_tts(
             text,
             model,
             prompt_text=prompt_text_clean,
             prompt_speech=prompt_speech
         )
-        return audio_output_path
+        for audio_chunk in gennerater:
+            yield audio_chunk
 
     # Define callback function for creating new voices
     def voice_creation(text, gender, pitch, speed):
@@ -132,6 +130,7 @@ def build_ui(model_dir, device=0):
                     prompt_wav_upload = gr.Audio(
                         sources="upload",
                         type="filepath",
+                        value="./assets/trump_en.wav",
                         label="Choose the prompt audio file, ensuring the sampling rate is no lower than 16kHz.",
                     )
                     prompt_wav_record = gr.Audio(
@@ -142,7 +141,7 @@ def build_ui(model_dir, device=0):
 
                 with gr.Row():
                     text_input = gr.Textbox(
-                        label="Text", lines=3, placeholder="Enter text here"
+                        label="Text", lines=3, placeholder="Enter text here", value="The combinations of different textures and flavors create a perfect harmony. The succulence of the steak, the tartness of the cranberries, the crunch of pine nuts, and creaminess of blue cheese make it a truly delectable delight. Enjoy your culinary adventure!"
                     )
                     prompt_text_input = gr.Textbox(
                         label="Text of prompt speech (Optional; recommended for cloning in the same language.)",
