@@ -68,7 +68,7 @@ def run_tts(
             speed,
         )
         for chunk_wav in generater:
-            print(type(chunk_wav))
+            # <class 'numpy.ndarray'>
             yield (16000, chunk_wav)
 
 

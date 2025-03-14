@@ -30,42 +30,56 @@ from transformers.generation.streamers import BaseStreamer
 
 class GeneratedIDsStreamer(BaseStreamer):
     """
-    自定义 streamer，用于流式提取生成的 token ids。
+    自定义 streamer，用于流式提取生成的 token ids，并将其扁平化累计，
+    当累计的 token 数大于等于 200 时 yield 出这一批 token id（作为一维列表）。
     """
     def __init__(self, tokenizer, skip_prompt=True, skip_special_tokens=True):
-        # 不传递额外参数给父类，仅调用默认初始化
+        # 仅调用父类的默认初始化
         super().__init__()
         self.tokenizer = tokenizer
         self.skip_prompt = skip_prompt
         self.skip_special_tokens = skip_special_tokens
-        self.generated_ids = []  # 存放增量生成的 token ids，每个元素通常是一批 token ids（tensor）
+        self.generated_ids = []  # 用于存放生成的 token id 批次，每个元素通常是 tensor 或列表
         self.lock = threading.Lock()
         self._finished = False
+        self._first = True
 
     def put(self, output_ids):
-        # generate() 调用过程中，每次生成一批 token ids 时调用此方法
+        """
+        在生成过程中，每当生成器输出一批 token ids 时调用，
+        将其添加到内部缓冲区中。
+        """
         with self.lock:
+            if self.skip_prompt and self._first:
+                self._first = False
+                return
             self.generated_ids.append(output_ids)
 
     def end(self):
-        # 标记生成结束
+        """
+        生成结束时调用，标记内部状态为完成。
+        """
         with self.lock:
             self._finished = True
 
     def __iter__(self):
+        accumulated_ids = []
         while True:
             with self.lock:
                 if self.generated_ids:
-                    # 复制当前缓冲区的内容，并清空缓冲区
-                    new_ids = self.generated_ids.copy()
+                    accumulated_ids.extend(self.generated_ids)
                     self.generated_ids.clear()
                 elif self._finished:
+                    if accumulated_ids:
+                        yield accumulated_ids
                     break
-                else:
-                    new_ids = []
-            for ids in new_ids:
-                yield ids
+
+            if len(accumulated_ids) >= 200:
+                print(accumulated_ids[0].device)
+                yield accumulated_ids
+                accumulated_ids = []
             time.sleep(0.1)
+
 
 class SparkTTS:
     """
@@ -227,6 +241,7 @@ class SparkTTS:
         Returns:
             torch.Tensor: Generated waveform as a tensor.
         """
+        start = time.time()
         if gender is not None:
             prompt = self.process_prompt_control(gender, pitch, speed, text)
 
@@ -252,16 +267,11 @@ class SparkTTS:
         thread = threading.Thread(target=self.model.generate, kwargs=generate_kwargs)
         thread.start()
 
+        is_first = True
         for generated_ids in streamer:
-
-            generated_ids = [generated_ids]
-            print(generated_ids)
-
-            # Trim the output tokens to remove the input tokens
-            # generated_ids = [
-            #     output_ids[len(input_ids) :]
-            #     for input_ids, output_ids in zip(model_inputs.input_ids, new_ids)
-            # ]
+            print('get generated_ids: ', generated_ids)
+            generated_ids = [torch.cat(generated_ids, dim=0).to(self.device).squeeze(0)]
+            print('converted generated_ids: ', generated_ids)
 
             # Decode the generated tokens into text
             predicts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
@@ -287,4 +297,8 @@ class SparkTTS:
                 pred_semantic_ids.to(self.device),
             )
 
+            if is_first:
+                print('首音延时: ', time.time() - start)
+
+            is_first = False
             yield wav
