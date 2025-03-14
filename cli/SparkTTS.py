@@ -27,6 +27,7 @@ from sparktts.utils.token_parser import LEVELS_MAP, GENDER_MAP, TASK_TOKEN_MAP
 import threading
 import time
 from transformers.generation.streamers import BaseStreamer
+import numpy as np
 
 class GeneratedIDsStreamer(BaseStreamer):
     """
@@ -68,17 +69,16 @@ class GeneratedIDsStreamer(BaseStreamer):
             with self.lock:
                 if self.generated_ids:
                     accumulated_ids.extend(self.generated_ids)
-                    self.generated_ids.clear()
+                    self.generated_ids = []
                 elif self._finished:
                     if accumulated_ids:
                         yield accumulated_ids
                     break
 
-            if len(accumulated_ids) >= 200:
-                print(accumulated_ids[0].device)
+            if len(accumulated_ids) >= 100:
                 yield accumulated_ids
                 accumulated_ids = []
-            time.sleep(0.1)
+            time.sleep(0.2)
 
 
 class SparkTTS:
@@ -210,6 +210,8 @@ class SparkTTS:
         ]
 
         return "".join(control_tts_inputs)
+    
+
 
     @torch.no_grad()
     def inference(
@@ -241,6 +243,7 @@ class SparkTTS:
         Returns:
             torch.Tensor: Generated waveform as a tensor.
         """
+        torch.manual_seed(789)
         start = time.time()
         if gender is not None:
             prompt = self.process_prompt_control(gender, pitch, speed, text)
@@ -249,6 +252,8 @@ class SparkTTS:
             prompt, global_token_ids = self.process_prompt(
                 text, prompt_speech_path, prompt_text
             )
+        print('prompt: ', prompt)
+        print('global_token_ids: ', global_token_ids)
         model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
 
 
@@ -269,9 +274,9 @@ class SparkTTS:
 
         is_first = True
         for generated_ids in streamer:
-            print('get generated_ids: ', generated_ids)
+            # print('get generated_ids: ', generated_ids)
             generated_ids = [torch.cat(generated_ids, dim=0).to(self.device).squeeze(0)]
-            print('converted generated_ids: ', generated_ids)
+            # print('converted generated_ids: ', generated_ids)
 
             # Decode the generated tokens into text
             predicts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
@@ -296,9 +301,77 @@ class SparkTTS:
                 global_token_ids.to(self.device).squeeze(0),
                 pred_semantic_ids.to(self.device),
             )
+            wav_int16 = (wav * 32767).astype(np.int16)
 
             if is_first:
                 print('首音延时: ', time.time() - start)
 
             is_first = False
-            yield wav
+            yield wav_int16
+
+    @torch.no_grad()
+    def inference_with_prompt(
+        self,
+        prompt: str,
+        temperature: float = 0.8,
+        top_k: float = 50,
+        top_p: float = 0.95,
+    ):
+        torch.manual_seed(789)
+        start = time.time()
+        
+        global_token_ids = (
+                    torch.tensor([int(token) for token in re.findall(r"bicodec_global_(\d+)", prompt)])
+                    .long()
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
+        
+        print('prompt: ', prompt)
+        print('global_token_ids: ', global_token_ids)
+        model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+
+
+        streamer = GeneratedIDsStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+        generate_kwargs = {
+            **model_inputs,
+            "max_new_tokens": 3000,
+            "do_sample": True,
+            "top_k": top_k,
+            "top_p": top_p,
+            "temperature": temperature,
+            "streamer": streamer,
+        }
+
+        thread = threading.Thread(target=self.model.generate, kwargs=generate_kwargs)
+        thread.start()
+
+        is_first = True
+        for generated_ids in streamer:
+            # print('get generated_ids: ', generated_ids)
+            generated_ids = [torch.cat(generated_ids, dim=0).to(self.device).squeeze(0)]
+            # print('converted generated_ids: ', generated_ids)
+
+            # Decode the generated tokens into text
+            predicts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+            # Extract semantic token IDs from the generated text
+            pred_semantic_ids = (
+                torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicts)])
+                .long()
+                .unsqueeze(0)
+            )
+
+            # Convert semantic tokens back to waveform
+            wav = self.audio_tokenizer.detokenize(
+                global_token_ids.to(self.device).squeeze(0),
+                pred_semantic_ids.to(self.device),
+            )
+            wav_int16 = (wav * 32767).astype(np.int16)
+
+            if is_first:
+                print('首音延时: ', time.time() - start)
+
+            is_first = False
+            yield wav_int16
