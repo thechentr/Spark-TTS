@@ -23,13 +23,15 @@ from sparktts.utils.file import load_config
 from sparktts.models.audio_tokenizer import BiCodecTokenizer
 from sparktts.utils.token_parser import LEVELS_MAP, GENDER_MAP, TASK_TOKEN_MAP
 
+import logging
+
 
 class SparkTTS:
     """
     Spark-TTS for text-to-speech generation.
     """
 
-    def __init__(self, model_dir: Path, device: torch.device = torch.device("cuda:0")):
+    def __init__(self, model_dir: Path, device: torch.device = torch.device("cuda:0"), quantization=False):
         """
         Initializes the SparkTTS model with the provided configurations and device.
 
@@ -41,14 +43,24 @@ class SparkTTS:
         self.model_dir = model_dir
         self.configs = load_config(f"{model_dir}/config.yaml")
         self.sample_rate = self.configs["sample_rate"]
-        self._initialize_inference()
+        self._initialize_inference(quantization)
 
-    def _initialize_inference(self):
+    def _initialize_inference(self, quantization):
         """Initializes the tokenizer, model, and audio tokenizer for inference."""
-        self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
-        self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM")
-        self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
-        self.model.to(self.device)
+        logging.info(f"Use quantization: {quantization}")
+        if quantization:
+            self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
+            self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM")
+            self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
+            self.model.to(self.device)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
+            self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM",     
+                                                            load_in_8bit=True,        # 开启 8-bit 量化加载
+                                                                device_map="auto",        # 自动分配设备（例如将部分模型放到GPU上）
+                                                                torch_dtype="bfloat16"    # 如果需要保留bfloat16精度的计算
+                                                            )
+            self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
 
     def process_prompt(
         self,
@@ -71,6 +83,7 @@ class SparkTTS:
         global_token_ids, semantic_token_ids = self.audio_tokenizer.tokenize(
             prompt_speech_path
         )
+        print(global_token_ids)
         global_tokens = "".join(
             [f"<|bicodec_global_{i}|>" for i in global_token_ids.squeeze()]
         )
@@ -106,6 +119,34 @@ class SparkTTS:
         inputs = "".join(inputs)
 
         return inputs, global_token_ids
+    
+    def process_prompt_global_token_ids(
+        self,
+        text: str,
+        global_token_ids: list,
+    ) -> str:
+        """
+        Process input with voice tensor for voice cloning.
+        """
+
+        global_tokens = "".join(
+            [f"<|bicodec_global_{i}|>" for i in global_token_ids]
+        )
+
+
+        inputs = [
+            TASK_TOKEN_MAP["tts"],
+            "<|start_content|>",
+            text,
+            "<|end_content|>",
+            "<|start_global_token|>",
+            global_tokens,
+            "<|end_global_token|>",
+        ]
+
+        inputs = "".join(inputs)
+
+        return inputs
 
     def process_prompt_control(
         self,
@@ -227,6 +268,59 @@ class SparkTTS:
                 .unsqueeze(0)
             )
 
+        # Convert semantic tokens back to waveform
+        wav = self.audio_tokenizer.detokenize(
+            global_token_ids.to(self.device).squeeze(0),
+            pred_semantic_ids.to(self.device),
+        )
+
+        return wav
+
+    @torch.no_grad()
+    def inference_prompt(
+        self,
+        text: str,
+        global_token_ids: list,
+        temperature: float = 0.8,
+        top_k: float = 50,
+        top_p: float = 0.95,
+    ) -> torch.Tensor:
+        """
+        Performs inference to generate speech from text, incorporating prompt audio and/or text.
+
+        Returns:
+            torch.Tensor: Generated waveform as a tensor.
+        """
+        assert len(global_token_ids) == 32, 'global_token_ids should coutain 32 ids'
+        prompt = self.process_prompt_global_token_ids(text, global_token_ids)
+        model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+
+        # Generate speech using the model
+        generated_ids = self.model.generate(
+            **model_inputs,
+            max_new_tokens=3000,
+            do_sample=True,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+        )
+
+        # Trim the output tokens to remove the input tokens
+        generated_ids = [
+            output_ids[len(input_ids) :]
+            for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+
+        # Decode the generated tokens into text
+        predicts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        # Extract semantic token IDs from the generated text
+        pred_semantic_ids = (
+            torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicts)])
+            .long()
+            .unsqueeze(0)
+        )
+        global_token_ids = torch.tensor([[global_token_ids]])
         # Convert semantic tokens back to waveform
         wav = self.audio_tokenizer.detokenize(
             global_token_ids.to(self.device).squeeze(0),
