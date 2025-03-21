@@ -1,0 +1,13 @@
+services:
+  tts:
+    image: spark:latest
+    container_name: spark
+    runtime: nvidia
+    ports:
+      - "8301:8301"
+    volumes:
+      - ./Spark-TTS:/Spark-TTS
+    working_dir: /Spark-TTS
+    environment:
+      ENV: "PROD"
+    command: tail -f /dev/null
