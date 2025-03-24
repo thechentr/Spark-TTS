@@ -60,7 +60,6 @@ def voice_clone_with_model_input(model, model_prompt: str, *voice_params):
     return  wav
 
 
-# 拼接所有生成的音频片段
 full_audio = voice_clone_with_model_input(model, model_prompt, int_ids)
 
 # 保存输出音频到文件
