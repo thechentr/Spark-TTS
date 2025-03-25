@@ -1,12 +1,15 @@
 services:
   tts:
     image: spark:latest
-    container_name: spark
+    container_name: spark_test
     runtime: nvidia
     ports:
       - "8301:8301"
+      - "8302:8302"
+      - "8303:8303"
     volumes:
       - ./:/app
+      - /data/models/Spark-TTS-0.5B:/models/Spark-TTS-0.5B
     working_dir: /app
     environment:
       ENV: "PROD"
