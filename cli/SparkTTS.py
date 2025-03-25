@@ -50,17 +50,18 @@ class SparkTTS:
         logging.info(f"Use quantization: {quantization}")
         if quantization:
             self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
-            self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM")
-            self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
-            self.model.to(self.device)
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
             self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM",     
                                                             load_in_8bit=True,        # 开启 8-bit 量化加载
                                                                 device_map="auto",        # 自动分配设备（例如将部分模型放到GPU上）
                                                                 torch_dtype="bfloat16"    # 如果需要保留bfloat16精度的计算
                                                             )
             self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(f"{self.model_dir}/LLM")
+            self.model = AutoModelForCausalLM.from_pretrained(f"{self.model_dir}/LLM")
+            self.audio_tokenizer = BiCodecTokenizer(self.model_dir, device=self.device)
+            self.model.to(self.device)
+            
 
     def process_prompt(
         self,

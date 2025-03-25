@@ -6,8 +6,9 @@ services:
     ports:
       - "8301:8301"
     volumes:
-      - ./Spark-TTS:/Spark-TTS
-    working_dir: /Spark-TTS
+      - ./:/app
+    working_dir: /app
     environment:
       ENV: "PROD"
-    command: tail -f /dev/null
+    # command: tail -f /dev/null
+    command:  bash -c "source /opt/conda/etc/profile.d/conda.sh && conda activate sparktts && jupyter lab --no-browser --port=8301 --ip=0.0.0.0 --allow-root"
